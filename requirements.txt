@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-multipart
+chromadb
+ollama
+pypdf
+pdfplumber
+pymupdf
+pytesseract
+Pillow
+sentence-transformers
