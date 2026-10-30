@@ -87,6 +87,102 @@ def store_chunks(chunks, filename, document_type):
     return len(ids)
 
 
+def store_invoice_records(invoices, filename):
+    """Store extracted invoice records in ChromaDB."""
+
+    if not invoices:
+        print("No invoice records found.")
+        return 0
+
+    documents = []
+    metadatas = []
+    ids = []
+
+    for invoice in invoices:
+
+        invoice_text = f"""
+Invoice Number: {invoice.get('invoice_number')}
+Invoice Date: {invoice.get('invoice_date')}
+Total Amount: {invoice.get('total_amount')}
+Pages: {invoice.get('pages')}
+"""
+
+        documents.append(invoice_text)
+
+        metadatas.append({
+            "filename": filename,
+            "document_type": "scanned_invoice",
+            "record_type": "invoice_record",
+            "invoice_number": str(
+                invoice.get("invoice_number") or ""
+            ),
+            "invoice_date": str(
+                invoice.get("invoice_date") or ""
+            ),
+            "total_amount": str(
+                invoice.get("total_amount") or ""
+            ),
+            "pages": ",".join(
+                str(page)
+                for page in invoice.get("pages", [])
+            )
+        })
+
+        ids.append(str(uuid4()))
+
+    embeddings = model.encode(
+        documents,
+        normalize_embeddings=True
+    ).tolist()
+
+    collection.add(
+        ids=ids,
+        documents=documents,
+        embeddings=embeddings,
+        metadatas=metadatas
+    )
+
+    print("Invoice records stored:", len(ids))
+    print("Invoice metadata:", metadatas)
+
+    return len(ids)
+
+
+def search_invoice_records(filename=None):
+    """Retrieve structured invoice records."""
+
+    filters = {
+        "$and": [
+            {"document_type": "scanned_invoice"},
+            {"record_type": "invoice_record"}
+        ]
+    }
+
+    if filename:
+        filters["$and"].append({
+            "filename": filename
+        })
+
+    results = collection.get(
+        where=filters,
+        include=["documents", "metadatas"]
+    )
+
+    invoices = []
+
+    for metadata in results["metadatas"]:
+
+        invoices.append({
+            "invoice_number": metadata.get("invoice_number", ""),
+            "invoice_date": metadata.get("invoice_date", ""),
+            "total_amount": metadata.get("total_amount", ""),
+            "pages": metadata.get("pages", "")
+        })
+
+    print("Invoice records retrieved:", len(invoices))
+
+    return invoices
+
 def search_chunks(question, document_type=None, top_k=3):
     """Find relevant chunks and remove short or duplicate results."""
 
