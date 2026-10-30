@@ -474,8 +474,13 @@ def merge_short_chunks(chunks, min_tokens=30, max_tokens=220):
         combined_text = pending["text"] + "\n\n" + chunk["text"]
         combined_tokens = count_tokens(combined_text)
 
+        same_pages = (
+            pending.get("pages", []) == chunk.get("pages", [])
+        )
+
         if (
-            pending["token_count"] < min_tokens
+            same_pages
+            and pending["token_count"] < min_tokens
             and combined_tokens <= max_tokens
         ):
             pending["text"] = combined_text
@@ -520,7 +525,50 @@ def process_pdf(
             "No readable text found in the PDF."
         )
 
-    if chunking_method == "fixed":
+    # Keep scanned invoices separate page by page.
+    # This prevents chunks from containing parts of two invoices.
+    if document_type == "scanned_invoice":
+        chunks = []
+
+        for page in pages:
+            page_text = page["text"].strip()
+
+            if not page_text:
+                continue
+
+            page_ranges_for_chunk = [{
+                "page": page["page"],
+                "start": 0,
+                "end": len(page_text)
+            }]
+
+            if chunking_method == "fixed":
+                page_chunks = fixed_size_chunk(
+                    page_text, page_ranges_for_chunk
+                )
+            elif chunking_method == "recursive":
+                page_chunks = recursive_chunk(
+                    page_text, page_ranges_for_chunk
+                )
+            elif chunking_method == "structure_aware":
+                page_chunks = structure_aware_chunk(
+                    page_text, page_ranges_for_chunk
+                )
+            elif chunking_method == "dynamic":
+                page_chunks = dynamic_chunk(
+                    page_text,
+                    page_ranges_for_chunk,
+                    document_type
+                )
+            else:
+                raise ValueError(
+                    "Invalid chunking method. Choose "
+                    "fixed, recursive, structure_aware, or dynamic."
+                )
+
+            chunks.extend(page_chunks)
+
+    elif chunking_method == "fixed":
 
         chunks = fixed_size_chunk(
             full_text,
