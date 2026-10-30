@@ -1,18 +1,11 @@
-
 from pathlib import Path
 from enum import Enum
-from parsers.document_parser import extract_pdf
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from parsers.policy_parser import parse_policy
-from parsers.product_parser import parse_product_documentation
 from parsers.invoice_parser import parse_invoice
-from parsers.troubleshooting_parser import (parse_troubleshooting_guide)
+from pdf_processor import process_pdf
 from vector_store import store_chunks, search_chunks
-from schemas import QuestionRequest
 from llm import generate_answer
-from vector_store import search_chunks
 from schemas import QuestionRequest
-from fastapi import HTTPException
 
 app = FastAPI(
     title="Smart Multi-Document RAG System",
@@ -64,31 +57,18 @@ async def upload_pdf(
     save_path.write_bytes(content)
 
     
+    
     try:
-        pages = extract_pdf(save_path)
-        if document_type == DocumentType.employee_policy:
-            chunks = parse_policy(pages)
-            extra_data = {}
-
-        elif document_type == DocumentType.product_documentation:
-            chunks = parse_product_documentation(pages)
-            extra_data = {}
-
-        elif document_type == DocumentType.scanned_invoice:
-            chunks, invoice_fields = parse_invoice(pages)
-            extra_data = {
-                "invoice_fields": invoice_fields
-            }
-
-        elif document_type == DocumentType.troubleshooting_guide:
-            chunks = parse_troubleshooting_guide(pages)
-            extra_data = {}
-
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="Unsupported document type."
-            )
+        pages, chunks = process_pdf(
+            file_path=str(save_path),
+            document_type=document_type.value,
+            chunking_method="dynamic"
+        )
+        extra_data = {}
+        if document_type == DocumentType.scanned_invoice:
+            _, invoices = parse_invoice(pages)
+            extra_data = {"invoices": invoices}
+            
         stored_count = store_chunks(
             chunks=chunks,
             filename=safe_filename,
@@ -126,8 +106,13 @@ def ask_question(request: QuestionRequest):
     matches = search_chunks(
         question=question,
         document_type=request.document_type,
-        top_k=request.top_k
+        top_k=5
     )
+    print("\n===== RETRIEVED CHUNKS =====")
+
+    for match in matches:
+        print(match["text"])
+        print("----------------------------")
 
     if not matches:
         return {
@@ -144,6 +129,8 @@ def ask_question(request: QuestionRequest):
             "filename": metadata["filename"],
             "document_type": metadata["document_type"],
             "page": metadata["page"],
+            "page_end": metadata["page_end"],
+            "pages": metadata["pages"],
             "text": match["text"]
         })
 

@@ -2,19 +2,40 @@
 import re
 from pathlib import Path
 from io import BytesIO
+from functools import lru_cache
+
 import pymupdf
 import pytesseract
 from PIL import Image
+from transformers import AutoTokenizer
 
-TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# MiniLM tokenizer
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+MAX_CHUNK_TOKENS = 220
+CHUNK_OVERLAP = 40
+
+TESSERACT_PATH = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+)
 
 if Path(TESSERACT_PATH).exists():
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
+
+@lru_cache(maxsize=1)
+def get_tokenizer():
+    return AutoTokenizer.from_pretrained(
+        MODEL_NAME,
+        use_fast=True
+    )
+
+
 def extract_pdf_pages(file_path):
     """
-    Extract text from each PDF page.
-    Use OCR when a page has little or no extractable text.
+    Extract text from every PDF page.
+    Use OCR when a page has little or no readable text.
     """
 
     pages = []
@@ -23,9 +44,11 @@ def extract_pdf_pages(file_path):
 
     try:
         for page_number, page in enumerate(pdf, start=1):
+
             text = page.get_text("text").strip()
 
             if len(text) < 30:
+
                 pix = page.get_pixmap(
                     matrix=pymupdf.Matrix(2, 2),
                     alpha=False
@@ -57,244 +80,423 @@ def extract_pdf_pages(file_path):
 
     return pages
 
-def fixed_size_chunk(text, page, chunk_size=1000, overlap=150):
+
+
+def combine_pages(pages):
     """
-    Split text into chunks using character length.
-    Overlap preserves some context between chunks.
-    """
-
-    chunks = []
-    text = text.strip()
-
-    if not text:
-        return chunks
-
-    start = 0
-
-    while start < len(text):
-        end = min(start + chunk_size, len(text))
-
-        chunk_text = text[start:end].strip()
-
-        if chunk_text:
-            chunks.append({
-                "page": page,
-                "text": chunk_text,
-                "chunking_method": "fixed"
-            })
-
-        if end == len(text):
-            break
-
-        start = end - overlap
-
-    return chunks
-
-def recursive_chunk(text, page, chunk_size=1000, overlap=150):
-    """
-    Prefer paragraph and sentence boundaries.
-    Fall back to smaller text boundaries when needed.
+    Combine all page text into one continuous document.
+    Preserve original page positions.
     """
 
-    chunks = []
-    text = text.strip()
+    full_text = []
+    page_ranges = []
+    current_position = 0
 
-    if not text:
-        return chunks
+    for page in pages:
 
-    paragraphs = re.split(r"\n\s*\n", text)
+        page_text = page["text"].strip()
 
-    current_chunk = ""
-
-    for paragraph in paragraphs:
-        paragraph = paragraph.strip()
-
-        if not paragraph:
+        if not page_text:
             continue
-        if len(paragraph) > chunk_size:
-            if current_chunk:
-                chunks.append({
-                    "page": page,
-                    "text": current_chunk.strip(),
-                    "chunking_method": "recursive"
-                })
-                current_chunk = ""
+        
+        if full_text:
+            separator = "\n\n"
+            full_text.append(separator)
+            current_position += len(separator)
 
-            sentences = re.split(
-                r"(?<=[.!?])\s+",
-                paragraph
-            )
+        start = current_position
 
-            for sentence in sentences:
-                if len(sentence) > chunk_size:
-                    chunks.extend(
-                        fixed_size_chunk(
-                            sentence,
-                            page,
-                            chunk_size,
-                            overlap
-                        )
-                    )
-                    continue
+        full_text.append(page_text)
 
-                if (
-                    current_chunk
-                    and len(current_chunk) + len(sentence) + 1
-                    > chunk_size
-                ):
-                    chunks.append({
-                        "page": page,
-                        "text": current_chunk.strip(),
-                        "chunking_method": "recursive"
-                    })
+        current_position += len(page_text)
 
-                    current_chunk = current_chunk[-overlap:]
+        end = current_position
 
-                current_chunk += " " + sentence
-
-            continue
-
-        if (
-            current_chunk
-            and len(current_chunk) + len(paragraph) + 2
-            > chunk_size
-        ):
-            chunks.append({
-                "page": page,
-                "text": current_chunk.strip(),
-                "chunking_method": "recursive"
-            })
-
-            current_chunk = current_chunk[-overlap:]
-
-        current_chunk += "\n\n" + paragraph
-
-    if current_chunk.strip():
-        chunks.append({
-            "page": page,
-            "text": current_chunk.strip(),
-            "chunking_method": "recursive"
+        page_ranges.append({
+            "page": page["page"],
+            "start": start,
+            "end": end
         })
 
-    return chunks
+    return "".join(full_text), page_ranges
 
-def structure_aware_chunk(text, page, chunk_size=1500):
+def get_token_offsets(text):
     """
-    Preserve numbered headings and related content.
-    Useful for employee policies and technical documents.
+    Get token positions using the MiniLM tokenizer.
     """
+
+    tokenizer = get_tokenizer()
+
+    encoded = tokenizer(
+        text,
+        add_special_tokens=False,
+        return_offsets_mapping=True,
+        truncation=False
+    )
+
+    return encoded["offset_mapping"]
+
+
+def count_tokens(text):
+    """
+    Count actual tokens using MiniLM tokenizer.
+    """
+
+    if not text.strip():
+        return 0
+
+    return len(get_token_offsets(text))
+
+
+def create_chunk(start, end, text, method, page_ranges):
+    """
+    Create a chunk and identify its source pages.
+    """
+
+    source_pages = []
+
+    for item in page_ranges:
+
+        if (
+            start < item["end"]
+            and end > item["start"]
+        ):
+            source_pages.append(item["page"])
+
+    token_count = count_tokens(text)
+
+    return {
+        "page": source_pages[0] if source_pages else 1,
+        "page_end": source_pages[-1] if source_pages else 1,
+        "pages": source_pages,
+        "text": text.strip(),
+        "chunking_method": method,
+        "token_count": token_count
+    }
+
+
+def fixed_size_chunk(
+    text,
+    page_ranges=None,
+    chunk_size=MAX_CHUNK_TOKENS,
+    overlap=CHUNK_OVERLAP
+):
+    """
+    Split text into fixed token-size chunks.
+    """
+
+    if not text.strip():
+        return []
+
+    if chunk_size <= 0 or overlap < 0 or overlap >= chunk_size:
+        raise ValueError("Invalid chunk size or overlap.")
+
+    offsets = get_token_offsets(text)
+
+    if not offsets:
+        return []
 
     chunks = []
-    text = text.strip()
+    start_token = 0
 
-    if not text:
-        return chunks
+    while start_token < len(offsets):
 
-    sections = re.split(
-        r"(?m)(?=^\s*(?:"
+        end_token = min(
+            start_token + chunk_size,
+            len(offsets)
+        )
+
+        char_start = offsets[start_token][0]
+        char_end = offsets[end_token - 1][1]
+
+        chunk_text = text[char_start:char_end].strip()
+
+        if chunk_text:
+            chunks.append(
+                create_chunk(
+                    char_start,
+                    char_end,
+                    chunk_text,
+                    "fixed",
+                    page_ranges or []
+                )
+            )
+
+        if end_token == len(offsets):
+            break
+
+        start_token = end_token - overlap
+
+    return chunks
+
+
+def recursive_chunk(
+    text,
+    page_ranges=None,
+    chunk_size=MAX_CHUNK_TOKENS,
+    overlap=CHUNK_OVERLAP
+):
+    """
+    Split text using paragraph, sentence and word boundaries.
+    Enforce the maximum token size.
+    """
+
+    if not text.strip():
+        return []
+
+    if chunk_size <= 0 or overlap < 0 or overlap >= chunk_size:
+        raise ValueError("Invalid chunk size or overlap.")
+
+    offsets = get_token_offsets(text)
+
+    if not offsets:
+        return []
+
+    chunks = []
+    start_token = 0
+
+    while start_token < len(offsets):
+
+        maximum_end = min(
+            start_token + chunk_size,
+            len(offsets)
+        )
+
+        end_token = maximum_end
+
+        if maximum_end < len(offsets):
+
+            target_position = offsets[maximum_end - 1][1]
+
+            minimum_position = offsets[
+                start_token + int(
+                    (maximum_end - start_token) * 0.70
+                )
+            ][0]
+
+            boundaries = list(
+                re.finditer(
+                    r"\n\s*\n|\n|(?<=[.!?])\s+|\s+",
+                    text[minimum_position:target_position]
+                )
+            )
+
+            if boundaries:
+
+                boundary = boundaries[-1]
+
+                boundary_position = (
+                    minimum_position + boundary.end()
+                )
+
+                for index in range(
+                    start_token + 1,
+                    maximum_end
+                ):
+
+                    if offsets[index][0] >= boundary_position:
+                        end_token = index
+                        break
+
+        char_start = offsets[start_token][0]
+        char_end = offsets[end_token - 1][1]
+
+        chunk_text = text[char_start:char_end].strip()
+
+        if chunk_text:
+            chunks.append(
+                create_chunk(
+                    char_start,
+                    char_end,
+                    chunk_text,
+                    "recursive",
+                    page_ranges or []
+                )
+            )
+
+        if end_token == len(offsets):
+            break
+
+        start_token = max(
+            start_token + 1,
+            end_token - overlap
+        )
+
+    return chunks
+
+
+def structure_aware_chunk(
+    text,
+    page_ranges=None,
+    chunk_size=MAX_CHUNK_TOKENS,
+    overlap=CHUNK_OVERLAP
+):
+    """
+    Identify document headings and preserve their content.
+    Split oversized sections using recursive chunking.
+    """
+
+    if not text.strip():
+        return []
+
+    heading_pattern = re.compile(
+        r"(?im)^\s*(?:"
         r"\d+(?:\.\d+)*[.)]?\s+\S+|"
+        r"#{1,6}\s+\S+|"
         r"Leave Type\s*$|"
         r"Annual Entitlement\s*$|"
         r"Approval Required\s*$|"
+        r"Step\s+\d+\b|"
         r"Warning\s*:|"
         r"Caution\s*:|"
         r"Note\s*:|"
-        r"Error\s*:"
-        r"))",
-        text,
-        flags=re.IGNORECASE
+        r"Error\s*:|"
+        r"Problem\s*:|"
+        r"Solution\s*:"
+        r")"
     )
 
-    current_chunk = ""
+    matches = list(heading_pattern.finditer(text))
 
-    for section in sections:
-        section = section.strip()
+    if not matches:
+        return recursive_chunk(
+            text,
+            page_ranges,
+            chunk_size,
+            overlap
+        )
 
-        if not section:
+    sections = []
+
+    if matches[0].start() > 0:
+        sections.append((0, matches[0].start()))
+
+    for index, match in enumerate(matches):
+
+        start = match.start()
+
+        end = (
+            matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(text)
+        )
+
+        sections.append((start, end))
+
+    chunks = []
+
+    for section_start, section_end in sections:
+
+        section_text = text[
+            section_start:section_end
+        ].strip()
+
+        if not section_text:
             continue
-        if len(section) > chunk_size:
-            if current_chunk.strip():
-                chunks.append({
-                    "page": page,
-                    "text": current_chunk.strip(),
-                    "chunking_method": "structure_aware"
-                })
-                current_chunk = ""
 
-            chunks.extend(
-                recursive_chunk(
-                    section,
-                    page,
-                    chunk_size=chunk_size,
-                    overlap=100
+        section_chunks = recursive_chunk(
+            section_text,
+            page_ranges=None,
+            chunk_size=chunk_size,
+            overlap=overlap
+        )
+
+        # Recover original document positions.
+        for chunk in section_chunks:
+
+            local_start = section_text.find(
+                chunk["text"]
+            )
+
+            absolute_start = (
+                section_start + local_start
+            )
+
+            absolute_end = (
+                absolute_start + len(chunk["text"])
+            )
+
+            chunks.append(
+                create_chunk(
+                    absolute_start,
+                    absolute_end,
+                    chunk["text"],
+                    "structure_aware",
+                    page_ranges or []
                 )
             )
-            continue
-
-        if (
-            current_chunk
-            and len(current_chunk) + len(section) + 2
-            > chunk_size
-        ):
-            chunks.append({
-                "page": page,
-                "text": current_chunk.strip(),
-                "chunking_method": "structure_aware"
-            })
-            current_chunk = ""
-
-        current_chunk += "\n\n" + section
-
-    if current_chunk.strip():
-        chunks.append({
-            "page": page,
-            "text": current_chunk.strip(),
-            "chunking_method": "structure_aware"
-        })
 
     return chunks
 
-def dynamic_chunk(text, page, document_type="employee_policy"):
-    """
-    Select a chunking strategy based on document type
-    and text characteristics.
-    """
 
-    text = text.strip()
-
-    if not text:
-        return []
+def dynamic_chunk(
+    text,
+    page_ranges=None,
+    document_type="employee_policy",
+    chunk_size=MAX_CHUNK_TOKENS,
+    overlap=CHUNK_OVERLAP
+):
+    """
+    Select a chunking strategy based on document type.
+    """
 
     if document_type in (
         "employee_policy",
         "product_documentation",
-        "troubleshooting_guide"
+        "troubleshooting_guide",
+        "scanned_invoice"
     ):
-        return structure_aware_chunk(
-            text,
-            page,
-            chunk_size=1500
-        )
 
-    if document_type == "scanned_invoice":
         return structure_aware_chunk(
             text,
-            page,
-            chunk_size=1200
+            page_ranges,
+            chunk_size,
+            overlap
         )
-    if len(text) <= 1500:
-        return [{
-            "page": page,
-            "text": text,
-            "chunking_method": "dynamic"
-        }]
 
     return recursive_chunk(
         text,
-        page,
-        chunk_size=1000,
-        overlap=150
+        page_ranges,
+        chunk_size,
+        overlap
     )
+
+def merge_short_chunks(chunks, min_tokens=30, max_tokens=220):
+    merged_chunks = []
+    pending = None
+
+    for chunk in chunks:
+
+        if pending is None:
+            pending = chunk.copy()
+            continue
+
+        combined_text = pending["text"] + "\n\n" + chunk["text"]
+        combined_tokens = count_tokens(combined_text)
+
+        if (
+            pending["token_count"] < min_tokens
+            and combined_tokens <= max_tokens
+        ):
+            pending["text"] = combined_text
+            pending["token_count"] = combined_tokens
+
+            pages = sorted(
+                set(pending.get("pages", []) + chunk.get("pages", []))
+            )
+
+            pending["pages"] = pages
+            pending["page"] = pages[0] if pages else None
+            pending["page_end"] = pages[-1] if pages else None
+
+        else:
+            merged_chunks.append(pending)
+            pending = chunk.copy()
+
+    if pending is not None:
+        merged_chunks.append(pending)
+
+    return merged_chunks
 
 def process_pdf(
     file_path,
@@ -302,53 +504,61 @@ def process_pdf(
     chunking_method="dynamic"
 ):
     """
-    Extract PDF text and create chunks.
+    Extract the complete PDF and create searchable chunks.
 
     Returns:
-        pages: extracted text by page
-        chunks: chunk dictionaries ready for vector storage
+        pages: Extracted page information.
+        chunks: Processed chunks with source metadata.
     """
 
     pages = extract_pdf_pages(file_path)
-    chunks = []
 
-    for page in pages:
-        text = page["text"]
+    full_text, page_ranges = combine_pages(pages)
 
-        if chunking_method == "fixed":
-            page_chunks = fixed_size_chunk(
-                text,
-                page["page"]
-            )
+    if not full_text.strip():
+        raise ValueError(
+            "No readable text found in the PDF."
+        )
 
-        elif chunking_method == "recursive":
-            page_chunks = recursive_chunk(
-                text,
-                page["page"]
-            )
+    if chunking_method == "fixed":
 
-        elif chunking_method == "structure_aware":
-            page_chunks = structure_aware_chunk(
-                text,
-                page["page"]
-            )
+        chunks = fixed_size_chunk(
+            full_text,
+            page_ranges
+        )
 
-        elif chunking_method == "dynamic":
-            page_chunks = dynamic_chunk(
-                text,
-                page["page"],
-                document_type
-            )
+    elif chunking_method == "recursive":
 
-        else:
-            raise ValueError(
-                "Invalid chunking method. Choose fixed, "
-                "recursive, structure_aware, or dynamic."
-            )
+        chunks = recursive_chunk(
+            full_text,
+            page_ranges
+        )
 
-        for chunk in page_chunks:
-            chunk["document_type"] = document_type
+    elif chunking_method == "structure_aware":
 
-        chunks.extend(page_chunks)
+        chunks = structure_aware_chunk(
+            full_text,
+            page_ranges
+        )
+
+    elif chunking_method == "dynamic":
+
+        chunks = dynamic_chunk(
+            full_text,
+            page_ranges,
+            document_type
+        )
+
+    else:
+        raise ValueError(
+            "Invalid chunking method. Choose "
+            "fixed, recursive, structure_aware, or dynamic."
+        )
+
+    chunks = merge_short_chunks(chunks)
+
+    for chunk in chunks:
+        chunk["document_type"] = document_type
+        chunk["chunking_method"] = chunking_method
 
     return pages, chunks

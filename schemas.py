@@ -1,16 +1,5 @@
 from pydantic import BaseModel, Field
 
-
-class QuestionRequest(BaseModel):
-    question: str = Field(
-        min_length=1,
-        max_length=2000
-    )
-
-class QuestionResponse(BaseModel):
-    question: str
-    answer: str
-
 class QuestionRequest(BaseModel):
     question: str = Field(
         ...,
@@ -29,3 +18,7 @@ class QuestionRequest(BaseModel):
         le=10,
         description="Number of relevant chunks to retrieve"
     )
+
+class QuestionResponse(BaseModel):
+    question: str
+    answer: str

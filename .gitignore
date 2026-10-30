@@ -9,3 +9,7 @@ wheels/
 # Virtual environments
 .venv
 .env
+.venv/
+venv/
+chroma_db/
+uploads/
